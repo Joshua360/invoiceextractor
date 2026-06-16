@@ -9,7 +9,7 @@ from parser_invoice import parse_invoice
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 
 st.title("Invoice Extractor")
-st.caption("Upload one invoice PDF at a time. Add an optional LPO PDF if needed.")
+st.caption("Upload one invoice PDF at a time.")
 
 OUTPUT_COLUMNS = [
     "DocNo",
@@ -50,21 +50,11 @@ if "last_action_message" not in st.session_state:
 if "last_invoice_preview" not in st.session_state:
     st.session_state.last_invoice_preview = None
 
-col1, col2 = st.columns(2)
-
-with col1:
-    invoice_file = st.file_uploader(
-        "Upload Invoice PDF",
-        type=["pdf"],
-        key="invoice_uploader",
-    )
-
-with col2:
-    lpo_file = st.file_uploader(
-        "Upload LPO PDF (optional)",
-        type=["pdf"],
-        key="lpo_uploader",
-    )
+invoice_file = st.file_uploader(
+    "Upload Invoice PDF",
+    type=["pdf"],
+    key="invoice_uploader",
+)
 
 manual_movement_date = st.text_input(
     "Manual Movement Date (optional)",
@@ -146,6 +136,9 @@ if process_clicked:
 
                 if entered_date:
                     message_parts.append(f"MovementDate set manually to {entered_date}")
+                else:
+                    if invoice_data["MovementDate"] == invoice_data["PostedOn"]:
+                        message_parts.append("MovementDate defaulted to PostedOn")
 
                 if entered_delivered_to:
                     message_parts.append(f"Delivered To set manually to {entered_delivered_to}")
@@ -177,18 +170,6 @@ if st.session_state.last_invoice_preview is not None:
     with st.expander("Debug: Raw text preview"):
         raw_text = preview.get("raw_text", "")
         st.text(raw_text[:4000] if raw_text else "")
-
-    with st.expander("Debug: Detected tables preview"):
-        tables_preview = preview.get("tables_preview", [])
-        if not tables_preview:
-            st.write("No tables detected.")
-        else:
-            for table_info in tables_preview:
-                st.write(
-                    f"**Table {table_info['table_number']}** "
-                    f"(rows: {table_info['row_count']})"
-                )
-                st.write(table_info["rows_preview"])
 
     with st.expander("Debug: Line preview"):
         for line in preview.get("line_preview", []):

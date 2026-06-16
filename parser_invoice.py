@@ -256,8 +256,6 @@ def split_words_into_item_columns(words, boundaries):
             qty_words.append(text)
         elif x < boundaries["pack_price"]:
             pack_words.append(text)
-        else:
-            pass
 
     return {
         "InvoiceCode": " ".join(code_words).strip(),
@@ -323,7 +321,6 @@ def refine_item_fields(item: dict) -> dict:
 
     qty_tokens = qty.split()
 
-    # Example: "Classique 36" -> move "Classique" back to description
     if qty_tokens:
         numeric_positions = [i for i, token in enumerate(qty_tokens) if is_numeric_token(token)]
         if numeric_positions:
@@ -336,7 +333,6 @@ def refine_item_fields(item: dict) -> dict:
                 description = f"{description} {moved_text}".strip()
                 qty = numeric_part
 
-    # Example: "6 1 x 750ml" in QtyCases -> split out pack text
     qty_tokens = qty.split()
     if len(qty_tokens) > 1 and looks_like_pack_text(qty):
         first_numeric = qty_tokens[0] if qty_tokens and is_numeric_token(qty_tokens[0]) else ""
@@ -347,7 +343,6 @@ def refine_item_fields(item: dict) -> dict:
             if not pack:
                 pack = remaining
 
-    # If qty still has mixed text, isolate numeric portion
     qty_tokens = qty.split()
     if qty_tokens and not all(is_numeric_token(tok) for tok in qty_tokens):
         numeric_only = [tok for tok in qty_tokens if is_numeric_token(tok)]
@@ -358,19 +353,15 @@ def refine_item_fields(item: dict) -> dict:
             if non_numeric:
                 description = f"{description} {' '.join(non_numeric)}".strip()
 
-    # Smart PackText repair
-    if is_complete_pack_text(pack):
-        pass
-    else:
+    if not is_complete_pack_text(pack):
         full_pack_from_line = extract_full_pack_text_from_text(source_text)
 
         if full_pack_from_line:
             pack = full_pack_from_line
-        else:
-            if re.fullmatch(r"\d+", pack):
-                size_only = extract_size_only_from_text(source_text)
-                if size_only:
-                    pack = f"{pack} x {size_only}"
+        elif re.fullmatch(r"\d+", pack):
+            size_only = extract_size_only_from_text(source_text)
+            if size_only:
+                pack = f"{pack} x {size_only}"
 
     item["InvoiceDescription"] = re.sub(r"\s+", " ", description).strip()
     item["QtyCases"] = re.sub(r"\s+", " ", qty).strip()
@@ -461,11 +452,17 @@ def parse_invoice(uploaded_file) -> dict:
 
     first_page_lines = pages_data[0]["lines"] if pages_data else []
 
+    posted_on = find_posting_date(raw_text)
+    movement_date = find_movement_date(raw_text)
+
+    if not movement_date:
+        movement_date = posted_on
+
     data = {
         "DocNo": find_doc_no(raw_text),
         "DocType": "Invoice",
-        "MovementDate": find_movement_date(raw_text),
-        "PostedOn": find_posting_date(raw_text),
+        "MovementDate": movement_date,
+        "PostedOn": posted_on,
         "Delivered To": find_delivery_address(first_page_lines),
         "Customer": find_customer(first_page_lines),
         "rows": parse_line_items(pages_data),
