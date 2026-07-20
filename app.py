@@ -41,6 +41,20 @@ def is_valid_date_format(value: str) -> bool:
         return False
 
 
+def is_duplicate_docno(master_df: pd.DataFrame, doc_no: str) -> bool:
+    if not doc_no:
+        return False
+
+    existing_docnos = (
+        master_df["DocNo"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    return doc_no.strip() in set(existing_docnos)
+
+
 if "master_df" not in st.session_state:
     st.session_state.master_df = pd.DataFrame(columns=OUTPUT_COLUMNS)
 
@@ -100,7 +114,17 @@ if process_clicked:
 
             st.session_state.last_invoice_preview = invoice_data
 
-            if not invoice_data["rows"]:
+            doc_no = str(invoice_data.get("DocNo", "")).strip()
+
+            if not doc_no:
+                st.session_state.last_action_message = (
+                    "This invoice could not be processed because no invoice number (DocNo) was found."
+                )
+            elif is_duplicate_docno(st.session_state.master_df, doc_no):
+                st.session_state.last_action_message = (
+                    f"Duplicate blocked: invoice {doc_no} has already been extracted in this batch."
+                )
+            elif not invoice_data["rows"]:
                 st.session_state.last_action_message = (
                     "No line items were extracted from the invoice. "
                     "Check the debug sections below."
@@ -131,6 +155,7 @@ if process_clicked:
 
                 message_parts = [
                     f"Processed invoice: {invoice_file.name}",
+                    f"DocNo: {doc_no}",
                     f"Rows added: {len(new_rows)}",
                 ]
 
