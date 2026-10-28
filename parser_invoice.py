@@ -2,128 +2,213 @@ import re
 import pdfplumber
 
 
+# =====================================================
+# REGULAR EXPRESSION PATTERNS
+# =====================================================
+
+DATE_PATTERN = r"(\d{1,2}/\d{1,2}/\d{4})"
+
 PACK_PATTERN = re.compile(
-    r"\b(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*(ml|l|ltr|litre|cl)\b",
-    re.IGNORECASE,
+    r"\b(\d+)\s*[xX×]\s*"
+    r"(\d+(?:\.\d+)?)\s*"
+    r"(ml|l|ltr|litre|cl)\b",
+    re.IGNORECASE
 )
 
-SIZE_ONLY_PATTERN = re.compile(
-    r"\b(\d+(?:\.\d+)?)\s*(ml|l|ltr|litre|cl)\b",
-    re.IGNORECASE,
+SIZE_PATTERN = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*"
+    r"(ml|l|ltr|litre|cl)\b",
+    re.IGNORECASE
+)
+
+NUMBER_PATTERN = re.compile(
+    r"\d+(?:\.\d+)?"
+)
+
+YEAR_PATTERN = re.compile(
+    r"(?:19|20)\d{2}"
 )
 
 
-def clean_text(value) -> str:
-    if value is None:
-        return ""
-    return str(value).replace("\n", " ").strip()
+# =====================================================
+# TEXT UTILITIES
+# =====================================================
+
+def clean_text(value):
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value or "")
+    ).strip()
 
 
-def normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", clean_text(value)).strip().lower()
+def normalize(value):
+    return clean_text(value).casefold()
 
 
-def word_center(word) -> float:
-    return (float(word["x0"]) + float(word["x1"])) / 2
+def word_center(word):
+    return (
+        float(word["x0"]) +
+        float(word["x1"])
+    ) / 2
 
 
-def group_words_into_lines(words, y_tolerance=3):
-    if not words:
-        return []
+# =====================================================
+# GROUP PDF WORDS INTO VISUAL LINES
+# =====================================================
 
-    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines = []
-    current_line = {
-        "top": words[0]["top"],
-        "words": [words[0]],
-    }
+def group_words_into_lines(
+    words,
+    y_tolerance=3
+):
+    groups = []
 
-    for word in words[1:]:
-        if abs(word["top"] - current_line["top"]) <= y_tolerance:
-            current_line["words"].append(word)
-        else:
-            current_line["words"] = sorted(current_line["words"], key=lambda w: w["x0"])
-            current_line["text"] = " ".join(clean_text(w["text"]) for w in current_line["words"])
-            lines.append(current_line)
+    sorted_words = sorted(
+        words,
+        key=lambda w: (
+            float(w["top"]),
+            float(w["x0"])
+        )
+    )
 
-            current_line = {
-                "top": word["top"],
-                "words": [word],
+    for word in sorted_words:
+
+        group = next(
+            (
+                g for g in groups[-2:]
+                if abs(
+                    float(word["top"]) - g["top"]
+                ) <= y_tolerance
+            ),
+            None
+        )
+
+        if group is None:
+
+            group = {
+                "top": float(word["top"]),
+                "words": []
             }
 
-    current_line["words"] = sorted(current_line["words"], key=lambda w: w["x0"])
-    current_line["text"] = " ".join(clean_text(w["text"]) for w in current_line["words"])
-    lines.append(current_line)
+            groups.append(group)
 
-    return lines
+        group["words"].append(word)
+
+    for group in groups:
+
+        group["words"].sort(
+            key=lambda w: float(w["x0"])
+        )
+
+        group["text"] = clean_text(
+            " ".join(
+                w["text"]
+                for w in group["words"]
+            )
+        )
+
+    return groups
 
 
-def extract_pages_with_lines(uploaded_file):
+# =====================================================
+# EXTRACT PDF CONTENT
+# =====================================================
+
+def extract_pages(uploaded_file):
+
     uploaded_file.seek(0)
+
     pages_data = []
 
     with pdfplumber.open(uploaded_file) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
+
+        for page_number, page in enumerate(
+            pdf.pages,
+            start=1
+        ):
+
             words = page.extract_words(
                 x_tolerance=2,
                 y_tolerance=3,
                 keep_blank_chars=False,
-                use_text_flow=False,
+                use_text_flow=False
             ) or []
 
-            lines = group_words_into_lines(words)
-
             pages_data.append({
+
                 "page_number": page_number,
+
                 "width": float(page.width),
-                "lines": lines,
+
+                "lines": group_words_into_lines(
+                    words
+                )
             })
 
     return pages_data
 
 
-def extract_raw_text(pages_data):
-    texts = []
-    for page in pages_data:
-        for line in page["lines"]:
-            texts.append(line["text"])
-    return "\n".join(texts)
+# =====================================================
+# INVOICE HEADER EXTRACTION
+# =====================================================
 
+def find_date(label, text):
 
-def find_doc_no(text: str) -> str:
-    match = re.search(r"\b(PSI\d+)\b", text, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
+    # Search one line at a time to avoid
+    # borrowing dates from unrelated fields.
 
+    for line in text.splitlines():
 
-def find_posting_date(text: str) -> str:
-    match = re.search(r"Posting\s+Date\s+(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
+        match = re.search(
+            rf"{label}\s*:?\s*{DATE_PATTERN}",
+            line,
+            re.IGNORECASE
+        )
 
-
-def find_movement_date(text: str) -> str:
-    patterns = [
-        r"Promised\s+Delivery\s+Date\s+(\d{2}/\d{2}/\d{4})",
-        r"Delivery\s+Date\s+(\d{2}/\d{2}/\d{4})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            return match.group(1)
 
     return ""
 
 
-def find_customer(lines) -> str:
+def find_invoice_number(text):
+
+    match = re.search(
+        r"\bPSI\d+\b",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(0).upper()
+
+    return ""
+
+
+def find_customer(lines):
+
     for line in lines:
+
         text = line["text"]
-        if re.match(r"^Customer\b", text, re.IGNORECASE):
-            value = re.sub(r"^Customer\s*:?\s*", "", text, flags=re.IGNORECASE).strip()
-            return value
+
+        if re.match(
+            r"^Customer\b",
+            text,
+            re.IGNORECASE
+        ):
+
+            return re.sub(
+                r"^Customer\s*:?\s*",
+                "",
+                text,
+                flags=re.IGNORECASE
+            ).strip()
+
     return ""
 
 
-def find_delivery_address(lines) -> str:
+def find_delivery_address(lines):
+
     stop_labels = (
         "Contact Name",
         "Contact No.",
@@ -133,342 +218,837 @@ def find_delivery_address(lines) -> str:
         "Company Reg No.",
         "Your Reference",
         "Invoice No.",
-        "SO No.",
+        "SO No."
     )
 
-    for i, line in enumerate(lines):
+    for index, line in enumerate(lines):
+
         text = line["text"]
 
-        if re.match(r"^Delivery\s+Address\b", text, re.IGNORECASE):
-            first_value = re.sub(
-                r"^Delivery\s+Address\s*:?\s*",
-                "",
-                text,
-                flags=re.IGNORECASE
-            ).strip()
+        if not re.match(
+            r"^Delivery\s+Address\b",
+            text,
+            re.IGNORECASE
+        ):
+            continue
 
-            parts = []
-            if first_value:
-                parts.append(first_value)
+        first_value = re.sub(
+            r"^Delivery\s+Address\s*:?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE
+        ).strip()
 
-            for next_line in lines[i + 1:]:
-                next_text = next_line["text"].strip()
+        parts = []
 
-                if not next_text:
-                    break
+        if first_value:
+            parts.append(first_value)
 
-                if any(next_text.startswith(label) for label in stop_labels):
-                    break
+        for next_line in lines[index + 1:]:
 
-                parts.append(next_text)
+            next_text = next_line["text"].strip()
 
-            return ", ".join(parts)
+            if not next_text:
+                break
+
+            if any(
+                next_text.casefold().startswith(
+                    label.casefold()
+                )
+                for label in stop_labels
+            ):
+                break
+
+            parts.append(next_text)
+
+        return ", ".join(parts)
 
     return ""
 
 
-def is_item_header_line(text: str) -> bool:
-    t = normalize(text)
-    return (
-        "code" in t and
-        "description" in t and
-        "quantity" in t and
-        "unit of measure" in t
+# =====================================================
+# IDENTIFY PRODUCT TABLE
+# =====================================================
+
+def is_item_header(text):
+
+    text = normalize(text)
+
+    required_labels = (
+        "code",
+        "description",
+        "quantity",
+        "unit of measure"
+    )
+
+    return all(
+        label in text
+        for label in required_labels
     )
 
 
-def is_totals_line(text: str) -> bool:
-    t = normalize(text)
-    return (
-        "total ksh excl" in t or
-        "total excl. vat" in t or
-        "vat :" in t or
-        "total ksh incl" in t
+def is_totals_line(text):
+
+    text = normalize(text)
+
+    stop_labels = (
+        "total ksh excl",
+        "total excl. vat",
+        "total ksh incl",
+        "grand total"
+    )
+
+    return any(
+        label in text
+        for label in stop_labels
     )
 
 
-def phrase_span(words, phrase_tokens):
-    normalized_words = [normalize(w["text"]) for w in words]
-    phrase_len = len(phrase_tokens)
+# =====================================================
+# FIND COLUMN POSITIONS
+# =====================================================
 
-    for i in range(len(normalized_words) - phrase_len + 1):
-        if normalized_words[i:i + phrase_len] == list(phrase_tokens):
-            matched_words = words[i:i + phrase_len]
-            return {
-                "x0": float(matched_words[0]["x0"]),
-                "x1": float(matched_words[-1]["x1"]),
-                "center": (float(matched_words[0]["x0"]) + float(matched_words[-1]["x1"])) / 2,
-            }
+def find_header_span(words, tokens):
+
+    terms = [
+        normalize(word["text"])
+        for word in words
+    ]
+
+    for start in range(
+        len(terms) - len(tokens) + 1
+    ):
+
+        if (
+            terms[start:start + len(tokens)]
+            == list(tokens)
+        ):
+
+            matching_words = words[
+                start:start + len(tokens)
+            ]
+
+            return (
+                float(matching_words[0]["x0"]) +
+                float(matching_words[-1]["x1"])
+            ) / 2
 
     return None
 
 
-def single_word_span(words, token):
-    for w in words:
-        if normalize(w["text"]) == token:
-            return {
-                "x0": float(w["x0"]),
-                "x1": float(w["x1"]),
-                "center": word_center(w),
-            }
-    return None
+def get_header_boundaries(
+    words,
+    page_width
+):
 
+    words = sorted(
+        words,
+        key=lambda w: w["x0"]
+    )
 
-def get_header_boundaries(header_words, page_width):
-    header_words = sorted(header_words, key=lambda w: w["x0"])
+    centers = [
 
-    code = single_word_span(header_words, "code")
-    description = single_word_span(header_words, "description")
-    quantity = single_word_span(header_words, "quantity")
-    unit_of_measure = phrase_span(header_words, ("unit", "of", "measure"))
-    unit_price = phrase_span(header_words, ("unit", "price"))
+        find_header_span(
+            words,
+            ("code",)
+        ),
 
-    if not all([code, description, quantity, unit_of_measure]):
+        find_header_span(
+            words,
+            ("description",)
+        ),
+
+        find_header_span(
+            words,
+            ("quantity",)
+        ),
+
+        find_header_span(
+            words,
+            ("unit", "of", "measure")
+        ),
+
+        find_header_span(
+            words,
+            ("unit", "price")
+        )
+    ]
+
+    if any(
+        value is None
+        for value in centers[:4]
+    ):
         return None
 
-    unit_price_center = unit_price["center"] if unit_price else page_width * 0.78
+    if centers[4] is None:
+        centers[4] = page_width * 0.78
 
-    boundaries = {
-        "code_desc": (code["center"] + description["center"]) / 2,
-        "desc_qty": (description["center"] + quantity["center"]) / 2,
-        "qty_pack": (quantity["center"] + unit_of_measure["center"]) / 2,
-        "pack_price": (unit_of_measure["center"] + unit_price_center) / 2,
-    }
+    return [
+        (
+            centers[i] +
+            centers[i + 1]
+        ) / 2
+        for i in range(4)
+    ]
 
-    return boundaries
 
+# =====================================================
+# SPLIT WORDS INTO PRODUCT COLUMNS
+# =====================================================
 
-def split_words_into_item_columns(words, boundaries):
-    code_words = []
-    desc_words = []
-    qty_words = []
-    pack_words = []
+def split_line_into_columns(
+    words,
+    boundaries
+):
 
-    for word in sorted(words, key=lambda w: w["x0"]):
+    parts = [
+        [],
+        [],
+        [],
+        []
+    ]
+
+    for word in sorted(
+        words,
+        key=lambda w: w["x0"]
+    ):
+
         x = word_center(word)
-        text = clean_text(word["text"])
 
-        if x < boundaries["code_desc"]:
-            code_words.append(text)
-        elif x < boundaries["desc_qty"]:
-            desc_words.append(text)
-        elif x < boundaries["qty_pack"]:
-            qty_words.append(text)
-        elif x < boundaries["pack_price"]:
-            pack_words.append(text)
+        column_index = next(
+            (
+                i
+                for i, boundary in enumerate(
+                    boundaries
+                )
+                if x < boundary
+            ),
+            4
+        )
+
+        if column_index < 4:
+
+            parts[column_index].append(
+                word["text"]
+            )
+
+    column_names = (
+        "InvoiceCode",
+        "InvoiceDescription",
+        "QtyCases",
+        "PackText"
+    )
 
     return {
-        "InvoiceCode": " ".join(code_words).strip(),
-        "InvoiceDescription": " ".join(desc_words).strip(),
-        "QtyCases": " ".join(qty_words).strip(),
-        "PackText": " ".join(pack_words).strip(),
+        key: clean_text(
+            " ".join(value)
+        )
+        for key, value in zip(
+            column_names,
+            parts
+        )
     }
 
 
-def is_numeric_token(token: str) -> bool:
-    token = token.strip().replace(",", "")
-    return bool(re.fullmatch(r"\d+(?:\.\d+)?", token))
+# =====================================================
+# PACK TEXT REPAIR
+# =====================================================
 
-
-def looks_like_pack_text(text: str) -> bool:
-    t = normalize(text)
-    return any(marker in t for marker in [" x ", "ml", "ltr", "l ", "litre", "btl", "bottle", "cl"])
-
-
-def normalize_pack_unit(unit: str) -> str:
-    u = unit.strip().lower()
-
-    if u in {"l", "ltr", "litre"}:
-        return "L"
-
-    if u in {"ml", "cl"}:
-        return u
-
-    return unit.strip()
-
-
-def format_pack_text(count: str, size: str, unit: str) -> str:
-    return f"{count.strip()} x {size.strip()}{normalize_pack_unit(unit)}"
-
-
-def is_complete_pack_text(text: str) -> bool:
-    return bool(PACK_PATTERN.fullmatch(clean_text(text)))
-
-
-def extract_full_pack_text_from_text(text: str) -> str:
-    match = PACK_PATTERN.search(clean_text(text))
-    if not match:
-        return ""
+def format_pack_text(match):
 
     count, size, unit = match.groups()
-    return format_pack_text(count, size, unit)
+
+    if unit.lower() in (
+        "l",
+        "ltr",
+        "litre"
+    ):
+        unit = "L"
+    else:
+        unit = unit.lower()
+
+    return f"{count} x {size}{unit}"
 
 
-def extract_size_only_from_text(text: str) -> str:
-    match = SIZE_ONLY_PATTERN.search(clean_text(text))
-    if not match:
-        return ""
+def is_complete_pack_text(text):
 
-    size, unit = match.groups()
-    return f"{size.strip()}{normalize_pack_unit(unit)}"
+    return bool(
+        PACK_PATTERN.fullmatch(
+            clean_text(text)
+        )
+    )
 
 
-def refine_item_fields(item: dict) -> dict:
-    description = clean_text(item.get("InvoiceDescription", ""))
-    qty = clean_text(item.get("QtyCases", ""))
-    pack = clean_text(item.get("PackText", ""))
-    source_text = clean_text(item.get("_source_text", ""))
+# =====================================================
+# CLEAN PRODUCT FIELDS
+# =====================================================
 
-    qty_tokens = qty.split()
+def refine_first_line(columns, original_text):
 
-    if qty_tokens:
-        numeric_positions = [i for i, token in enumerate(qty_tokens) if is_numeric_token(token)]
-        if numeric_positions:
-            last_num_idx = numeric_positions[-1]
-            leading_tokens = qty_tokens[:last_num_idx]
-            numeric_part = " ".join(qty_tokens[last_num_idx:]).strip()
+    description = clean_text(
+        columns["InvoiceDescription"]
+    )
 
-            if leading_tokens and all(not is_numeric_token(tok) for tok in leading_tokens):
-                moved_text = " ".join(leading_tokens).strip()
-                description = f"{description} {moved_text}".strip()
-                qty = numeric_part
+    quantity = clean_text(
+        columns["QtyCases"]
+    )
 
-    qty_tokens = qty.split()
-    if len(qty_tokens) > 1 and looks_like_pack_text(qty):
-        first_numeric = qty_tokens[0] if qty_tokens and is_numeric_token(qty_tokens[0]) else ""
-        remaining = " ".join(qty_tokens[1:]).strip()
+    pack_text = clean_text(
+        columns["PackText"]
+    )
 
-        if first_numeric and remaining and looks_like_pack_text(remaining):
-            qty = first_numeric
-            if not pack:
-                pack = remaining
+    warnings = []
 
-    qty_tokens = qty.split()
-    if qty_tokens and not all(is_numeric_token(tok) for tok in qty_tokens):
-        numeric_only = [tok for tok in qty_tokens if is_numeric_token(tok)]
-        non_numeric = [tok for tok in qty_tokens if not is_numeric_token(tok)]
+    # ------------------------------------------
+    # 1. Repair pack text merged into quantity
+    #
+    # Example:
+    # QtyCases = "6 1 x 750ml"
+    #
+    # Result:
+    # QtyCases = "6"
+    # PackText = "1 x 750ml"
+    # ------------------------------------------
 
-        if numeric_only:
-            qty = numeric_only[-1]
-            if non_numeric:
-                description = f"{description} {' '.join(non_numeric)}".strip()
+    pack_match = PACK_PATTERN.search(
+        quantity
+    )
 
-    if not is_complete_pack_text(pack):
-        full_pack_from_line = extract_full_pack_text_from_text(source_text)
+    if pack_match:
 
-        if full_pack_from_line:
-            pack = full_pack_from_line
-        elif re.fullmatch(r"\d+", pack):
-            size_only = extract_size_only_from_text(source_text)
-            if size_only:
-                pack = f"{pack} x {size_only}"
+        if not is_complete_pack_text(
+            pack_text
+        ):
 
-    item["InvoiceDescription"] = re.sub(r"\s+", " ", description).strip()
-    item["QtyCases"] = re.sub(r"\s+", " ", qty).strip()
-    item["PackText"] = re.sub(r"\s+", " ", pack).strip()
+            pack_text = format_pack_text(
+                pack_match
+            )
 
-    return item
+        quantity = clean_text(
+            quantity[:pack_match.start()]
+            + " "
+            + quantity[pack_match.end():]
+        )
 
+    # ------------------------------------------
+    # 2. Repair incomplete PackText
+    #
+    # Only replace an incomplete value.
+    # Correct PackText remains untouched.
+    # ------------------------------------------
+
+    if not is_complete_pack_text(
+        pack_text
+    ):
+
+        full_pack = PACK_PATTERN.search(
+            original_text
+        )
+
+        if full_pack:
+
+            pack_text = format_pack_text(
+                full_pack
+            )
+
+        elif re.fullmatch(
+            r"\d+",
+            pack_text
+        ):
+
+            size_match = SIZE_PATTERN.search(
+                original_text
+            )
+
+            if size_match:
+
+                size = size_match.group(1)
+                unit = size_match.group(2)
+
+                if unit.lower() in (
+                    "l",
+                    "ltr",
+                    "litre"
+                ):
+                    unit = "L"
+                else:
+                    unit = unit.lower()
+
+                pack_text = (
+                    f"{pack_text} x {size}{unit}"
+                )
+
+    # ------------------------------------------
+    # 3. Identify numeric quantity tokens
+    # ------------------------------------------
+
+    tokens = quantity.split()
+
+    numeric_tokens = [
+        token
+        for token in tokens
+        if NUMBER_PATTERN.fullmatch(
+            token.replace(",", "")
+        )
+    ]
+
+    # ------------------------------------------
+    # 4. Identify misplaced vintage years
+    #
+    # Example:
+    # QtyCases = "2025 6"
+    #
+    # 2025 is a vintage year.
+    # 6 is the actual quantity.
+    # ------------------------------------------
+
+    vintage_years = []
+
+    if len(numeric_tokens) > 1:
+
+        vintage_years = [
+            token
+            for token in numeric_tokens
+            if YEAR_PATTERN.fullmatch(token)
+        ]
+
+    actual_quantities = [
+        token
+        for token in numeric_tokens
+        if token not in vintage_years
+    ]
+
+    # ------------------------------------------
+    # 5. Move misplaced description words
+    #
+    # Example:
+    # QtyCases = "Classique 36"
+    #
+    # Classique belongs to description.
+    # ------------------------------------------
+
+    misplaced_words = [
+        token
+        for token in tokens
+        if token not in numeric_tokens
+    ]
+
+    if misplaced_words:
+
+        description = clean_text(
+            description
+            + " "
+            + " ".join(misplaced_words)
+        )
+
+    # ------------------------------------------
+    # 6. Enforce numeric-only QtyCases
+    # ------------------------------------------
+
+    if (
+        len(actual_quantities) == 1
+        and YEAR_PATTERN.fullmatch(
+            actual_quantities[0]
+        )
+        and not vintage_years
+    ):
+
+        # A lone year is not enough to
+        # determine the actual quantity.
+
+        description = clean_text(
+            description
+            + " "
+            + actual_quantities[0]
+        )
+
+        quantity = ""
+
+        warnings.append(
+            "Only a possible vintage year "
+            "was found in QtyCases."
+        )
+
+    elif len(actual_quantities) == 1:
+
+        quantity = actual_quantities[
+            0
+        ].replace(",", "")
+
+    else:
+
+        quantity = ""
+
+        warnings.append(
+            "QtyCases could not be "
+            "identified unambiguously."
+        )
+
+    # ------------------------------------------
+    # 7. Move vintage years to description
+    # ------------------------------------------
+
+    for year in vintage_years:
+
+        if not description.endswith(
+            " " + year
+        ):
+
+            description = clean_text(
+                description + " " + year
+            )
+
+    return {
+
+        "InvoiceCode": clean_text(
+            columns["InvoiceCode"]
+        ),
+
+        "InvoiceDescription": description,
+
+        "QtyCases": quantity,
+
+        "PackText": pack_text,
+
+        "_warnings": warnings
+    }
+
+
+# =====================================================
+# DECIDE IF LINE STARTS A NEW PRODUCT
+# =====================================================
+
+def is_new_item(columns):
+
+    code = columns["InvoiceCode"]
+
+    quantity = columns["QtyCases"]
+
+    pack = columns["PackText"]
+
+    # A standalone vintage year is not
+    # a new product.
+
+    if (
+        YEAR_PATTERN.fullmatch(code)
+        and not quantity
+        and not pack
+    ):
+        return False
+
+    if code and (quantity or pack):
+        return True
+
+    if (
+        code
+        and not YEAR_PATTERN.fullmatch(code)
+        and columns["InvoiceDescription"]
+    ):
+        return True
+
+    return False
+
+
+# =====================================================
+# EXTRACT WRAPPED DESCRIPTION TEXT
+# =====================================================
+
+def get_continuation_text(
+    words,
+    boundaries
+):
+
+    # Preserve the actual left-to-right
+    # order of words across the visual line.
+
+    text_parts = []
+
+    for word in sorted(
+        words,
+        key=lambda w: w["x0"]
+    ):
+
+        x = word_center(word)
+
+        if (
+            boundaries[0]
+            <= x
+            < boundaries[3]
+        ):
+
+            text_parts.append(
+                str(word["text"])
+            )
+
+    return clean_text(
+        " ".join(text_parts)
+    )
+
+
+# =====================================================
+# KEEP VINTAGE YEAR AT END OF DESCRIPTION
+# =====================================================
+
+def keep_vintage_at_end(description):
+
+    words = clean_text(
+        description
+    ).split()
+
+    vintage_words = [
+        word
+        for word in words
+        if YEAR_PATTERN.fullmatch(word)
+    ]
+
+    other_words = [
+        word
+        for word in words
+        if not YEAR_PATTERN.fullmatch(word)
+    ]
+
+    return clean_text(
+        " ".join(
+            other_words + vintage_words
+        )
+    )
+
+
+# =====================================================
+# PARSE ALL PRODUCT ROWS
+# =====================================================
 
 def parse_line_items(pages_data):
+
     items = []
 
-    for page in pages_data:
-        lines = page["lines"]
-        width = page["width"]
+    current_item = None
 
-        header_found = False
-        current_item = None
+    finished = False
+
+    def save_current_item():
+
+        nonlocal current_item
+
+        if current_item:
+
+            # All continuation lines have now
+            # been read. Move vintage to end.
+
+            current_item[
+                "InvoiceDescription"
+            ] = keep_vintage_at_end(
+                current_item[
+                    "InvoiceDescription"
+                ]
+            )
+
+            if (
+                current_item["InvoiceCode"]
+                and current_item[
+                    "InvoiceDescription"
+                ]
+            ):
+
+                items.append(
+                    current_item
+                )
+
+            current_item = None
+
+    for page in pages_data:
+
+        inside_table = False
+
         boundaries = None
 
-        for line in lines:
-            text = line["text"].strip()
+        for line in page["lines"]:
 
-            if not header_found:
-                if is_item_header_line(text):
-                    header_found = True
-                    boundaries = get_header_boundaries(line["words"], width)
+            text = line["text"]
+
+            if is_item_header(text):
+
+                inside_table = True
+
+                boundaries = (
+                    get_header_boundaries(
+                        line["words"],
+                        page["width"]
+                    )
+                )
+
+                continue
+
+            if (
+                not inside_table
+                or boundaries is None
+            ):
                 continue
 
             if is_totals_line(text):
-                if current_item and (current_item["InvoiceCode"] or current_item["InvoiceDescription"]):
-                    items.append(refine_item_fields(current_item))
-                    current_item = None
+
+                save_current_item()
+
+                finished = True
+
                 break
 
-            if boundaries is None:
+            columns = split_line_into_columns(
+                line["words"],
+                boundaries
+            )
+
+            if not any(
+                columns.values()
+            ):
                 continue
 
-            columns = split_words_into_item_columns(line["words"], boundaries)
+            if is_new_item(columns):
 
-            has_code = bool(columns["InvoiceCode"])
-            has_desc = bool(columns["InvoiceDescription"])
-            has_qty = bool(columns["QtyCases"])
-            has_pack = bool(columns["PackText"])
+                save_current_item()
 
-            if not (has_code or has_desc or has_qty or has_pack):
-                continue
+                current_item = refine_first_line(
+                    columns,
+                    text
+                )
 
-            if has_code or has_qty or has_pack:
-                if current_item and (current_item["InvoiceCode"] or current_item["InvoiceDescription"]):
-                    items.append(refine_item_fields(current_item))
+            elif current_item:
 
-                current_item = {
-                    "InvoiceCode": columns["InvoiceCode"],
-                    "InvoiceDescription": columns["InvoiceDescription"],
-                    "QtyCases": columns["QtyCases"],
-                    "PackText": columns["PackText"],
-                    "_source_text": text,
-                }
-            else:
-                if current_item and has_desc:
-                    current_item["InvoiceDescription"] = (
-                        f"{current_item['InvoiceDescription']} {columns['InvoiceDescription']}"
-                    ).strip()
-                    current_item["_source_text"] = (
-                        f"{current_item.get('_source_text', '')} {text}"
-                    ).strip()
+                continuation = (
+                    get_continuation_text(
+                        line["words"],
+                        boundaries
+                    )
+                )
 
-        if current_item and (current_item["InvoiceCode"] or current_item["InvoiceDescription"]):
-            candidate = refine_item_fields(current_item)
-            if not items or items[-1] != candidate:
-                items.append(candidate)
+                if continuation:
+
+                    current_item[
+                        "InvoiceDescription"
+                    ] = clean_text(
+                        current_item[
+                            "InvoiceDescription"
+                        ]
+                        + " "
+                        + continuation
+                    )
+
+        if finished:
+            break
+
+    save_current_item()
 
     return items
 
 
-def build_line_preview(pages_data):
-    preview = []
-    for page in pages_data:
-        preview.append(f"--- PAGE {page['page_number']} ---")
-        for line in page["lines"][:40]:
-            preview.append(line["text"])
-    return preview
+# =====================================================
+# MAIN INVOICE PARSER
+# =====================================================
 
+def parse_invoice(uploaded_file):
 
-def parse_invoice(uploaded_file) -> dict:
-    pages_data = extract_pages_with_lines(uploaded_file)
-    raw_text = extract_raw_text(pages_data)
+    pages_data = extract_pages(
+        uploaded_file
+    )
 
-    first_page_lines = pages_data[0]["lines"] if pages_data else []
+    raw_text = "\n".join(
+        line["text"]
+        for page in pages_data
+        for line in page["lines"]
+    )
 
-    posted_on = find_posting_date(raw_text)
-    movement_date = find_movement_date(raw_text)
+    first_page_lines = (
+        pages_data[0]["lines"]
+        if pages_data
+        else []
+    )
 
-    if not movement_date:
-        movement_date = posted_on
+    doc_no = find_invoice_number(
+        raw_text
+    )
 
-    data = {
-        "DocNo": find_doc_no(raw_text),
+    posted_on = find_date(
+        r"Posting\s+Date",
+        raw_text
+    )
+
+    promised_date = find_date(
+        r"Promised\s+Delivery\s+Date",
+        raw_text
+    )
+
+    # If Promised Delivery Date is missing,
+    # use Posting Date.
+
+    movement_date = (
+        promised_date or posted_on
+    )
+
+    product_rows = parse_line_items(
+        pages_data
+    )
+
+    warnings = []
+
+    for index, item in enumerate(
+        product_rows,
+        start=1
+    ):
+
+        for warning in item.pop(
+            "_warnings",
+            []
+        ):
+
+            warnings.append(
+                f"Line {index}: {warning}"
+            )
+
+        # Final numeric quantity validation
+
+        if not NUMBER_PATTERN.fullmatch(
+            item["QtyCases"]
+        ):
+
+            warnings.append(
+                f"Line {index}: "
+                f"QtyCases is missing or invalid."
+            )
+
+    return {
+
+        "DocNo": doc_no,
+
         "DocType": "Invoice",
-        "MovementDate": movement_date,
-        "PostedOn": posted_on,
-        "Delivered To": find_delivery_address(first_page_lines),
-        "Customer": find_customer(first_page_lines),
-        "rows": parse_line_items(pages_data),
-        "raw_text": raw_text,
-        "tables_preview": [],
-        "line_preview": build_line_preview(pages_data),
-    }
 
-    return data
+        "MovementDate": movement_date,
+
+        "PostedOn": posted_on,
+
+        "Delivered To":
+            find_delivery_address(
+                first_page_lines
+            ),
+
+        "Customer":
+            find_customer(
+                first_page_lines
+            ),
+
+        "rows": product_rows,
+
+        "warnings": warnings,
+
+        "raw_text": raw_text,
+
+        "line_preview": [
+            (
+                f"-- PAGE {page['page_number']} --\n"
+                + "\n".join(
+                    line["text"]
+                    for line in page["lines"][:50]
+                )
+            )
+            for page in pages_data
+        ],
+    }
