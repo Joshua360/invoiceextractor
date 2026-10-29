@@ -154,9 +154,6 @@ def extract_pages(uploaded_file):
 
 def find_date(label, text):
 
-    # Search one line at a time to avoid
-    # borrowing dates from unrelated fields.
-
     for line in text.splitlines():
 
         match = re.search(
@@ -301,6 +298,59 @@ def is_totals_line(text):
     return any(
         label in text
         for label in stop_labels
+    )
+
+
+# =====================================================
+# NEW: IDENTIFY INVOICE FOOTER
+# =====================================================
+
+def is_footer_line(text):
+    """
+    Detect content that belongs to the invoice
+    footer rather than the product table.
+
+    Especially useful for sample invoices that
+    do not contain a totals section.
+    """
+
+    text = clean_text(text)
+
+    footer_patterns = [
+
+        # Normal invoice footer
+        r"^thanks\s+for\s+your\s+business\b",
+
+        # Banking details footer
+        r"^banking\s+details\b",
+
+        # Sample invoice footer
+        r"^email\s+us\b",
+
+        # Other email labels
+        r"^email\s+address\s*:?",
+
+        r"^e-?mail\s*:",
+
+        # Supplier email addresses
+        r"^mwkorders@\S+",
+
+        # Standalone email address
+        r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
+
+        # Common footer labels
+        r"^printed\s+by\b",
+
+        r"^generated\s+by\b",
+    ]
+
+    return any(
+        re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+        for pattern in footer_patterns
     )
 
 
@@ -501,13 +551,6 @@ def refine_first_line(columns, original_text):
 
     # ------------------------------------------
     # 1. Repair pack text merged into quantity
-    #
-    # Example:
-    # QtyCases = "6 1 x 750ml"
-    #
-    # Result:
-    # QtyCases = "6"
-    # PackText = "1 x 750ml"
     # ------------------------------------------
 
     pack_match = PACK_PATTERN.search(
@@ -532,9 +575,6 @@ def refine_first_line(columns, original_text):
 
     # ------------------------------------------
     # 2. Repair incomplete PackText
-    #
-    # Only replace an incomplete value.
-    # Correct PackText remains untouched.
     # ------------------------------------------
 
     if not is_complete_pack_text(
@@ -594,12 +634,6 @@ def refine_first_line(columns, original_text):
 
     # ------------------------------------------
     # 4. Identify misplaced vintage years
-    #
-    # Example:
-    # QtyCases = "2025 6"
-    #
-    # 2025 is a vintage year.
-    # 6 is the actual quantity.
     # ------------------------------------------
 
     vintage_years = []
@@ -620,11 +654,6 @@ def refine_first_line(columns, original_text):
 
     # ------------------------------------------
     # 5. Move misplaced description words
-    #
-    # Example:
-    # QtyCases = "Classique 36"
-    #
-    # Classique belongs to description.
     # ------------------------------------------
 
     misplaced_words = [
@@ -652,9 +681,6 @@ def refine_first_line(columns, original_text):
         )
         and not vintage_years
     ):
-
-        # A lone year is not enough to
-        # determine the actual quantity.
 
         description = clean_text(
             description
@@ -726,9 +752,6 @@ def is_new_item(columns):
 
     pack = columns["PackText"]
 
-    # A standalone vintage year is not
-    # a new product.
-
     if (
         YEAR_PATTERN.fullmatch(code)
         and not quantity
@@ -757,9 +780,6 @@ def get_continuation_text(
     words,
     boundaries
 ):
-
-    # Preserve the actual left-to-right
-    # order of words across the visual line.
 
     text_parts = []
 
@@ -815,6 +835,32 @@ def keep_vintage_at_end(description):
 
 
 # =====================================================
+# NEW: DETECT LARGE GAPS BELOW PRODUCT ROWS
+# =====================================================
+
+def is_large_gap(
+    previous_top,
+    current_top,
+    threshold=65
+):
+    """
+    A large vertical gap may indicate
+    the product table has ended.
+
+    The check is only used for lines that
+    do not look like new product rows.
+    """
+
+    if previous_top is None:
+        return False
+
+    return (
+        float(current_top)
+        - float(previous_top)
+    ) > threshold
+
+
+# =====================================================
 # PARSE ALL PRODUCT ROWS
 # =====================================================
 
@@ -832,8 +878,8 @@ def parse_line_items(pages_data):
 
         if current_item:
 
-            # All continuation lines have now
-            # been read. Move vintage to end.
+            # Preserve the description words
+            # while keeping the vintage at the end.
 
             current_item[
                 "InvoiceDescription"
@@ -862,9 +908,18 @@ def parse_line_items(pages_data):
 
         boundaries = None
 
+        # Track the last product/continuation
+        # line within this page only.
+
+        last_product_top = None
+
         for line in page["lines"]:
 
             text = line["text"]
+
+            # -----------------------------------
+            # Find the product table header
+            # -----------------------------------
 
             if is_item_header(text):
 
@@ -877,6 +932,8 @@ def parse_line_items(pages_data):
                     )
                 )
 
+                last_product_top = None
+
                 continue
 
             if (
@@ -885,6 +942,11 @@ def parse_line_items(pages_data):
             ):
                 continue
 
+            # -----------------------------------
+            # STOP RULE 1:
+            # Normal invoice totals
+            # -----------------------------------
+
             if is_totals_line(text):
 
                 save_current_item()
@@ -892,6 +954,26 @@ def parse_line_items(pages_data):
                 finished = True
 
                 break
+
+            # -----------------------------------
+            # STOP RULE 2:
+            # Invoice footer content
+            #
+            # This fixes the sample invoice
+            # without a totals section.
+            # -----------------------------------
+
+            if is_footer_line(text):
+
+                save_current_item()
+
+                finished = True
+
+                break
+
+            # -----------------------------------
+            # Split the current visual line
+            # -----------------------------------
 
             columns = split_line_into_columns(
                 line["words"],
@@ -903,7 +985,39 @@ def parse_line_items(pages_data):
             ):
                 continue
 
-            if is_new_item(columns):
+            new_product = is_new_item(
+                columns
+            )
+
+            # -----------------------------------
+            # STOP RULE 3:
+            # Large gap followed by text that
+            # does not look like another product.
+            #
+            # This helps with unfamiliar footers
+            # that don't contain known labels.
+            # -----------------------------------
+
+            if (
+                current_item is not None
+                and not new_product
+                and is_large_gap(
+                    last_product_top,
+                    line["top"]
+                )
+            ):
+
+                save_current_item()
+
+                finished = True
+
+                break
+
+            # -----------------------------------
+            # Normal new product row
+            # -----------------------------------
+
+            if new_product:
 
                 save_current_item()
 
@@ -911,6 +1025,12 @@ def parse_line_items(pages_data):
                     columns,
                     text
                 )
+
+                last_product_top = line["top"]
+
+            # -----------------------------------
+            # Description continuation
+            # -----------------------------------
 
             elif current_item:
 
@@ -933,8 +1053,13 @@ def parse_line_items(pages_data):
                         + continuation
                     )
 
+                    last_product_top = line["top"]
+
         if finished:
             break
+
+    # Save the last product when there are
+    # no totals or recognizable footer.
 
     save_current_item()
 
@@ -977,8 +1102,9 @@ def parse_invoice(uploaded_file):
         raw_text
     )
 
-    # If Promised Delivery Date is missing,
-    # use Posting Date.
+    # MovementDate priority:
+    # Promised Delivery Date first,
+    # otherwise Posting Date.
 
     movement_date = (
         promised_date or posted_on
@@ -1003,8 +1129,6 @@ def parse_invoice(uploaded_file):
             warnings.append(
                 f"Line {index}: {warning}"
             )
-
-        # Final numeric quantity validation
 
         if not NUMBER_PATTERN.fullmatch(
             item["QtyCases"]
